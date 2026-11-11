@@ -18,6 +18,7 @@
     "rooted_dirt_placement.TreeFeatureMixin",
     "rooted_dirt_placement.TrunkPlacerMixin",
     "tree_pushing.ServerboundPunchSubLevelPacketMixin",
+    "tree_splitting.FireBlockMixin",
     "tree_splitting.SubLevelAssemblyHelperMixin",
     "walk_through_leaves.BlockCollisionsMixin",
     "walk_through_leaves.BlockStateBaseMixin",

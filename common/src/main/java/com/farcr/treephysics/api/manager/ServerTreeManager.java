@@ -5,6 +5,8 @@ import com.farcr.treephysics.index.TreePhysicsConfig;
 import com.farcr.treephysics.networking.UpdateClientTrees;
 import dev.ryanhcode.sable.api.physics.PhysicsPipeline;
 import dev.ryanhcode.sable.api.physics.handle.RigidBodyHandle;
+import dev.ryanhcode.sable.companion.math.BoundingBox3i;
+import dev.ryanhcode.sable.companion.math.BoundingBox3ic;
 import dev.ryanhcode.sable.companion.math.JOMLConversion;
 import dev.ryanhcode.sable.physics.config.dimension_physics.DimensionPhysicsData;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
@@ -13,6 +15,7 @@ import dev.ryanhcode.sable.sublevel.system.SubLevelPhysicsSystem;
 import foundry.veil.api.network.VeilPacketManager;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -20,11 +23,16 @@ import net.minecraft.nbt.NbtOps;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.BaseFireBlock;
 import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.saveddata.SavedData;
+import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Vector3d;
 
@@ -47,6 +55,10 @@ public class ServerTreeManager extends SavedData implements TreeManager {
     }
 
     private static final double STOPPED_THRESHOLD = 0.15;
+    // Fixed samples per tick keep big trees as cheap as small ones; the chance makes catching fire take
+    // a moment instead of happening on first contact.
+    private static final int IGNITION_SAMPLES_PER_TICK = 3;
+    private static final float IGNITION_CHANCE = 0.3f;
 
     public void physicsTick(ServerLevel level, SubLevelPhysicsSystem system, PhysicsPipeline pipeline, double timeStep) {
         if(this.trees.isEmpty()) return;
@@ -106,6 +118,8 @@ public class ServerTreeManager extends SavedData implements TreeManager {
                 tree.leafBreakProgress++;
             }*/
 
+            this.igniteFromWorld(subLevel);
+
             if(this.shouldDespawn(tree)) {
                 if(TreePhysicsConfig.DROP_ITEMS_ON_DESPAWN.get()) {
                     for (BlockPos pos : TreeUtil.plotIterator(subLevel)) {
@@ -122,6 +136,57 @@ public class ServerTreeManager extends SavedData implements TreeManager {
             this.setDirty(true);
         }
 
+    }
+
+    /**
+     * A fallen tree's blocks live in its plot, away from the world blocks they appear next to, so world
+     * lava and fire never reach them. Light the plot when a sampled block touches either.
+     */
+    private void igniteFromWorld(SubLevel subLevel) {
+        if(!this.level.getGameRules().getBoolean(GameRules.RULE_DOFIRETICK)) return;
+
+        BoundingBox3ic box = subLevel.getPlot().getBoundingBox();
+        if(box.equals(BoundingBox3i.EMPTY)) return;
+
+        BlockPos.MutableBlockPos plotPos = new BlockPos.MutableBlockPos();
+        for (int i = 0; i < IGNITION_SAMPLES_PER_TICK; i++) {
+            plotPos.set(
+                    box.minX() + this.level.random.nextInt(box.maxX() - box.minX() + 1),
+                    box.minY() + this.level.random.nextInt(box.maxY() - box.minY() + 1),
+                    box.minZ() + this.level.random.nextInt(box.maxZ() - box.minZ() + 1));
+            // Same flammability check vanilla lava uses. Cheap checks first: the world lookup costs more.
+            if(!this.level.getBlockState(plotPos).ignitedByLava()) continue;
+            if(this.level.random.nextFloat() > IGNITION_CHANCE) continue;
+
+            // The tree can be at any angle, so this is the world block nearest the plot block's center.
+            Vec3 worldCenter = subLevel.logicalPose().transformPosition(plotPos.getCenter());
+            if(!this.touchesWorldHeat(BlockPos.containing(worldCenter))) continue;
+
+            // Fire goes in the plot, so it moves with the tree and vanilla spreading takes over.
+            for (Direction direction : Direction.values()) {
+                BlockPos firePos = plotPos.relative(direction);
+                if(this.level.getBlockState(firePos).isAir()) {
+                    this.level.setBlockAndUpdate(firePos, BaseFireBlock.getState(this.level, firePos));
+                    return;
+                }
+            }
+        }
+    }
+
+    private boolean touchesWorldHeat(BlockPos worldPos) {
+        // The block's own position counts too: a tree sunk into lava overlaps it.
+        if(this.isHeat(worldPos)) return true;
+        for (Direction direction : Direction.values()) {
+            if(this.isHeat(worldPos.relative(direction))) return true;
+        }
+        return false;
+    }
+
+    private boolean isHeat(BlockPos pos) {
+        // A tree near a chunk edge shouldn't load chunks just to look for heat.
+        if(!this.level.isLoaded(pos)) return false;
+        BlockState state = this.level.getBlockState(pos);
+        return state.getFluidState().is(FluidTags.LAVA) || state.is(BlockTags.FIRE);
     }
 
     public void setTree(SubLevel subLevel) {
